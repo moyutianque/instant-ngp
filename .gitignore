@@ -13,3 +13,14 @@
 __pycache__
 .DS_Store
 imgui.ini
+
+
+*.png
+color
+sem
+traj.txt
+transforms.json
+Datasets
+intrinsic_color.txt
+transforms-old.json
+*.db

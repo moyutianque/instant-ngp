@@ -43,18 +43,58 @@ __global__ void extract_density(
 }
 
 template <typename T>
+__global__ void extract_sem(
+	const uint32_t n_elements,
+	const uint32_t sem_stride,
+	const uint32_t rgbd_plus_stride,
+	const T* __restrict__ sem,
+	T* __restrict__ rgbd_plus
+) {
+    // NOTE: blockDim.x is how many threads in the block, one array is split into 
+    //    multiple blocks and each element is executed in one thread
+    //    so i means the exact index of the element 
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+    const uint32_t elem_idx = i / 40; // the row number in flattened sem [N, 40]
+	const uint32_t dim_idx = i - elem_idx * 40; // i % 40 in python
+
+    rgbd_plus[elem_idx*rgbd_plus_stride + dim_idx + 4] = sem[elem_idx*sem_stride + dim_idx];
+}
+
+template <typename T>
+__global__ void extract_sem_back(
+	const uint32_t n_elements,
+	const uint32_t sem_stride,
+	const uint32_t rgbd_plus_stride,
+	const T* __restrict__ rgbd_plus,
+	T* __restrict__ sem
+) {
+    // NOTE: blockDim.x is how many threads in the block, one array is split into 
+    //    multiple blocks and each element is executed in one thread
+    //    so i means the exact index of the element 
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+    const uint32_t elem_idx = i / 40; // the row number in flattened sem [N, 40]
+	const uint32_t dim_idx = i - elem_idx * 40; // i % 40 in python
+
+    sem[elem_idx*sem_stride + dim_idx] = rgbd_plus[elem_idx*rgbd_plus_stride + dim_idx + 4];
+}
+
+template <typename T>
 __global__ void extract_rgb(
 	const uint32_t n_elements,
 	const uint32_t rgb_stride,
 	const uint32_t output_stride,
-	const T* __restrict__ rgbd,
+	const T* __restrict__ rgbd, // rgb density
 	T* __restrict__ rgb
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
 
-	const uint32_t elem_idx = i / 3;
-	const uint32_t dim_idx = i - elem_idx * 3;
+	const uint32_t elem_idx = i / 3; // the row number in flattened rgb [N, 3]
+	const uint32_t dim_idx = i - elem_idx * 3; // i % 3 in python
 
 	rgb[elem_idx*rgb_stride + dim_idx] = rgbd[elem_idx*output_stride + dim_idx];
 }
@@ -62,15 +102,17 @@ __global__ void extract_rgb(
 template <typename T>
 __global__ void add_density_gradient(
 	const uint32_t n_elements,
-	const uint32_t rgbd_stride,
+	const uint32_t output_stride,
 	const T* __restrict__ rgbd,
 	const uint32_t density_stride,
-	T* __restrict__ density
+	T* __restrict__ density,
+    const T* __restrict__ density_sem_branch,
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
 
-	density[i * density_stride] += rgbd[i * rgbd_stride + 3];
+	density[i * density_stride] += rgbd[i * output_stride + 3];
+    density[i * density_stride] += density_sem_branch[i * density_stride];
 }
 
 template <typename T>
@@ -78,7 +120,7 @@ class NerfNetwork : public tcnn::Network<float, T> {
 public:
 	using json = nlohmann::json;
 
-	NerfNetwork(uint32_t n_pos_dims, uint32_t n_dir_dims, uint32_t n_extra_dims, uint32_t dir_offset, const json& pos_encoding, const json& dir_encoding, const json& density_network, const json& rgb_network) : m_n_pos_dims{n_pos_dims}, m_n_dir_dims{n_dir_dims}, m_dir_offset{dir_offset}, m_n_extra_dims{n_extra_dims} {
+	NerfNetwork(uint32_t n_pos_dims, uint32_t n_dir_dims, uint32_t n_extra_dims, uint32_t dir_offset, const json& pos_encoding, const json& dir_encoding, const json& density_network, const json& rgb_network, const json& sem_network) : m_n_pos_dims{n_pos_dims}, m_n_dir_dims{n_dir_dims}, m_dir_offset{dir_offset}, m_n_extra_dims{n_extra_dims} {
 		m_pos_encoding.reset(tcnn::create_encoding<T>(n_pos_dims, pos_encoding, density_network.contains("otype") && (tcnn::equals_case_insensitive(density_network["otype"], "FullyFusedMLP") || tcnn::equals_case_insensitive(density_network["otype"], "MegakernelMLP")) ? 16u : 8u));
 		uint32_t rgb_alignment = tcnn::minimum_alignment(rgb_network);
 		m_dir_encoding.reset(tcnn::create_encoding<T>(m_n_dir_dims + m_n_extra_dims, dir_encoding, rgb_alignment));
@@ -96,6 +138,10 @@ public:
 		local_rgb_network_config["n_input_dims"] = m_rgb_network_input_width;
 		local_rgb_network_config["n_output_dims"] = 3;
 		m_rgb_network.reset(tcnn::create_network<T>(local_rgb_network_config));
+
+		json local_sem_network_config = sem_network;
+		m_sem_network_input_width = local_sem_network_config["n_input_dims"]; 
+		m_sem_network.reset(tcnn::create_network<T>(local_sem_network_config));
 	}
 
 	virtual ~NerfNetwork() { }
@@ -158,7 +204,8 @@ public:
 		);
 
 		forward->density_network_output = forward->rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
-		forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
+		forward->sem_network_input = forward->density_network_output;
+        forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
 
 		auto dir_out = forward->rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
 		forward->dir_encoding_ctx = m_dir_encoding->forward(
@@ -178,6 +225,16 @@ public:
 		if (output) {
 			tcnn::linear_kernel(extract_density<T>, 0, stream,
 				batch_size, m_dir_encoding->preferred_output_layout() == tcnn::AoS ? forward->density_network_output.stride() : 1, padded_output_width(), forward->density_network_output.data(), output->data()+3
+			);
+		}
+        // TODO: print m_dir_encoding->preferred_output_layout() check output size
+
+		// NOTE forward semantic
+        forward->sem_network_ctx = m_sem_network->forward(stream, forward->sem_network_input, output ? &forward->sem_network_output : nullptr, use_inference_params, prepare_input_gradients);
+		if (output) {
+            // save to output tensor
+            tcnn::linear_kernel(extract_sem<T>, 0, stream,
+				batch_size, m_sem_network.padded_output_width(), padded_output_width(), forward->sem_network_output.data(), output->data()
 			);
 		}
 
@@ -203,7 +260,7 @@ public:
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_drgb.data(), 0, dL_drgb.n_bytes(), stream));
 		tcnn::linear_kernel(extract_rgb<T>, 0, stream,
 			batch_size*3, dL_drgb.m(), dL_doutput.m(), dL_doutput.data(), dL_drgb.data()
-		);
+		); 
 
 		const tcnn::GPUMatrixDynamic<T> rgb_network_output{(T*)output.data(), m_rgb_network->padded_output_width(), batch_size, output.layout()};
 		tcnn::GPUMatrixDynamic<T> dL_drgb_network_input{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
@@ -229,13 +286,30 @@ public:
 			);
 		}
 
+        // NOTE sem module backward
+        // NOTE m() means return num rows in matrix; n() means return num columns
+        tcnn::GPUMatrix<T> dL_dsem{m_sem_network->padded_output_width(), batch_size, stream};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dsem.data(), 0, dL_dsem.n_bytes(), stream));
+        tcnn::linear_kernel(extract_sem_back<T>, 0, stream,
+			batch_size*40, dL_dsem.m(), dL_doutput.m(), dL_doutput.data(), dL_dsem.data()
+		); 
+        // NOTE check what is output
+		const tcnn::GPUMatrixDynamic<T> sem_network_output{(T*)output.data(), m_sem_network->padded_output_width(), batch_size, output.layout()};
+        tcnn::GPUMatrixDynamic<T> dL_dsem_network_input{m_sem_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
+        m_sem_network->backward(stream, *forward.sem_network_ctx, forward.sem_network_input, sem_network_output, 
+                dL_dsem, &dL_dsem_network_input, use_inference_params, param_gradients_mode);
+        // NOTE dL_ddensity_network_output semantic module part
+        tcnn::GPUMatrixDynamic<T> dL_ddensity_network_output_sem = dL_dsem_network_input;
+
+        // density module backward
 		tcnn::GPUMatrixDynamic<T> dL_ddensity_network_output = dL_drgb_network_input.slice_rows(0, m_density_network->padded_output_width());
 		tcnn::linear_kernel(add_density_gradient<T>, 0, stream,
 			batch_size,
 			dL_doutput.m(),
 			dL_doutput.data(),
 			dL_ddensity_network_output.layout() == tcnn::RM ? 1 : dL_ddensity_network_output.stride(),
-			dL_ddensity_network_output.data()
+			dL_ddensity_network_output.data(),
+            dL_ddensity_network_output_sem.date()
 		);
 
 		tcnn::GPUMatrixDynamic<T> dL_ddensity_network_input;
@@ -445,7 +519,7 @@ public:
 	}
 
 	uint32_t padded_output_width() const override {
-		return std::max(m_rgb_network->padded_output_width(), (uint32_t)4);
+		return (uint32_t)4 + m_sem_network.padded_output_width();
 	}
 
 	uint32_t input_width() const override {
@@ -523,10 +597,12 @@ public:
 private:
 	std::unique_ptr<tcnn::Network<T>> m_density_network;
 	std::unique_ptr<tcnn::Network<T>> m_rgb_network;
+	std::unique_ptr<tcnn::Network<T>> m_sem_network;
 	std::shared_ptr<tcnn::Encoding<T>> m_pos_encoding;
 	std::shared_ptr<tcnn::Encoding<T>> m_dir_encoding;
 
 	uint32_t m_rgb_network_input_width;
+	uint32_t m_sem_network_input_width;
 	uint32_t m_n_pos_dims;
 	uint32_t m_n_dir_dims;
 	uint32_t m_n_extra_dims; // extra dimensions are assumed to be part of a compound encoding with dir_dims
@@ -538,12 +614,15 @@ private:
 		tcnn::GPUMatrixDynamic<T> density_network_output;
 		tcnn::GPUMatrixDynamic<T> rgb_network_input;
 		tcnn::GPUMatrix<T> rgb_network_output;
+		tcnn::GPUMatrixDynamic<T> sem_network_input;
+		tcnn::GPUMatrix<T> sem_network_output;
 
 		std::unique_ptr<Context> pos_encoding_ctx;
 		std::unique_ptr<Context> dir_encoding_ctx;
 
 		std::unique_ptr<Context> density_network_ctx;
 		std::unique_ptr<Context> rgb_network_ctx;
+		std::unique_ptr<Context> sem_network_ctx;
 	};
 };
 
